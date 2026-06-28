@@ -2264,7 +2264,21 @@ function clearResults(){['f-best','f-avgl','f-prpm','f-pegt','f-megt','f-spd'].f
 function clearForm(){document.querySelectorAll('#tab-log input,#tab-log select,#tab-log textarea').forEach(el=>{if(el.id!=='f-editing-id')el.value=''});formTags=[];renderFormTags();document.getElementById('log-diag-output').innerHTML='<div style="color:var(--text2);font-size:13px">Fill in weather, carb, and EGT fields above.</div>'}
 
 // ─── EXPORT / IMPORT ──────────────────────────────────────────────────────────
-function exportDB(){
+async function reSyncAllToCloud(){
+  if(!currentUser){showToast('Sign in to sync to cloud','warn');return;}
+  const btn=document.getElementById('resync-btn');
+  if(btn){btn.disabled=true;btn.innerHTML='<i class="ti ti-loader"></i>';}
+  showToast('Syncing '+sessions.length+' sessions to cloud…','info');
+  let ok=0,fail=0;
+  for(const s of sessions){
+    try{ await syncSessionToCloud(s); ok++; }
+    catch(e){ fail++; }
+  }
+  if(btn){btn.disabled=false;btn.innerHTML='<i class="ti ti-cloud-upload"></i>';}
+  showToast(ok+' sessions synced'+(fail?' · '+fail+' failed':''),'success');
+  // Reload from cloud to get authoritative UUIDs back
+  await loadSessionsFromCloud();
+}
   const now=new Date();
   const blob=new Blob([JSON.stringify({version:3,exported:now.toISOString(),sessions},null,2)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
@@ -8686,7 +8700,14 @@ function showApp(){
   // Load local first for instant render, then refresh from cloud
   loadSessions();
   renderDB();
-  loadSessionsFromCloud();
+  loadSessionsFromCloud().then(()=>{
+    // After cloud load, push any local-only sessions that haven't synced yet
+    const unsynced=sessions.filter(s=>!s._fromCloud);
+    if(unsynced.length>0){
+      console.log('Auto-syncing',unsynced.length,'local sessions to cloud');
+      unsynced.reduce((p,s)=>p.then(()=>syncSessionToCloud(s)),Promise.resolve());
+    }
+  });
 }
 
 // ── Sync dot helper ──────────────────────────────────────────
@@ -8700,7 +8721,6 @@ async function syncSessionToCloud(session){
   if(!currentUser) return;
   setSyncDot('syncing');
   try {
-    const isUUID=typeof session.id==='string'&&session.id.includes('-');
     const payload={
       user_id: currentUser.id,
       date: session.date||null, time: session.time||null,
@@ -8729,31 +8749,46 @@ async function syncSessionToCloud(session){
       peak_speed: session.spd||null,
       session_notes: session.notes||null, engineer_notes: session.engn||null
     };
-    if(isUUID) payload.id=session.id;
-    const headers={...getAuthHeaders(),'Prefer':'return=representation'};
-    const resp=await fetch(`${SUPA_URL}/rest/v1/sessions`,{
-      method:'POST',
-      headers,
-      body:JSON.stringify(payload)
-    });
-    // Use upsert via header if record already exists
-    if(resp.status===409||resp.status===23505){
-      // Conflict — update instead
-      const updateResp=await fetch(
+
+    // Check if session already has a Supabase UUID
+    const isUUID=typeof session.id==='string'&&session.id.includes('-');
+
+    if(isUUID){
+      // Already has UUID — PATCH to update existing row
+      const headers={...getAuthHeaders(),'Prefer':'return=minimal'};
+      payload.id=session.id;
+      const resp=await fetch(
         `${SUPA_URL}/rest/v1/sessions?id=eq.${session.id}&user_id=eq.${currentUser.id}`,
         {method:'PATCH',headers,body:JSON.stringify(payload)}
       );
-      setSyncDot(updateResp.ok?'synced':'error');
-      return;
+      setSyncDot(resp.ok?'synced':'error');
+      if(!resp.ok) console.warn('Cloud PATCH failed:',resp.status);
+    } else {
+      // New session with local timestamp ID — POST to insert, get back UUID
+      const headers={...getAuthHeaders(),'Prefer':'return=representation'};
+      const resp=await fetch(`${SUPA_URL}/rest/v1/sessions`,{
+        method:'POST',
+        headers,
+        body:JSON.stringify(payload)
+      });
+      if(!resp.ok){
+        console.warn('Cloud POST failed:',resp.status);
+        setSyncDot('error');
+        return;
+      }
+      const data=await resp.json();
+      const newId=Array.isArray(data)?data[0]?.id:data?.id;
+      if(newId){
+        // Write Supabase UUID back to local session so future saves PATCH not POST
+        const idx=sessions.findIndex(s=>s.id===session.id);
+        if(idx>=0){
+          sessions[idx].id=newId;
+          sessions[idx]._fromCloud=true;
+          saveSessions();
+        }
+      }
+      setSyncDot('synced');
     }
-    if(!resp.ok) throw new Error('HTTP '+resp.status);
-    const data=await resp.json();
-    const newId=Array.isArray(data)?data[0]?.id:data?.id;
-    if(newId&&!isUUID){
-      const idx=sessions.findIndex(s=>s.id===session.id);
-      if(idx>=0){sessions[idx].id=newId;sessions[idx]._fromCloud=true;saveSessions();}
-    }
-    setSyncDot('synced');
   } catch(e){
     setSyncDot('error');
     console.warn('Cloud sync failed:',e);
