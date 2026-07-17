@@ -11457,9 +11457,7 @@ async function doSignOut(){
   } catch(e){}
   purgeLocalAccountData();
   currentUser=null; currentProfile=null;
-  document.getElementById('main-app').style.display='none';
-  document.getElementById('auth-screen').style.display='flex';
-  authTab('login');
+  window.location.href='index.html';
 }
 
 // ── Delete account ───────────────────────────────────────────
